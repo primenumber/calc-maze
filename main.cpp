@@ -12,10 +12,10 @@
 #include <boost/functional/hash.hpp>
 #include <boost/optional.hpp>
 #include "unistd.h"
-#include <gperftools/profiler.h>
+//#include <gperftools/profiler.h>
 #include "bits.hpp"
 
-constexpr int INF = 100000;
+constexpr int INF = 20000;
 
 constexpr int GRID_SIZE = 7;
 constexpr int PATH_SIZE = 2 * GRID_SIZE * (GRID_SIZE - 1);
@@ -58,20 +58,6 @@ struct Path {
   Path &operator=(Path &&) = default;
 };
 
-namespace std {
-  
-template<>
-class hash<Path> {
- public:
-  size_t operator()(const Path &path) const {
-    size_t bits_hash = hash<PathBits>()(path.bits);
-    boost::hash_combine(bits_hash, path.x + path.y * 7);
-    return bits_hash;
-  }
-};
-
-} // namespace std
-
 bool operator==(const PathBits &lhs, const PathBits &rhs) {
   return lhs.data == rhs.data;
 }
@@ -98,7 +84,7 @@ struct PathWithScore {
   int16_t lower_bound;
   int16_t upper_bound;
   PathWithScore(const Path &path, const int score)
-    : path(path), score(score) {}
+    : path(path), score(score), lower_bound(-INF), upper_bound(INF) {}
   PathWithScore(const PathWithScore &) = default;
   PathWithScore(PathWithScore &&) = default;
   PathWithScore &operator=(const PathWithScore &) = default;
@@ -117,10 +103,17 @@ Table<T> make_table(const int h, const int w, const T &val) {
   return Table<T>(h, std::vector<T>(w, val));
 }
 
+template <typename T>
+Table<T> make_table(const int h, const int w) {
+  Table<T> res;
+  for (int i = 0; i < h; ++i) res.emplace_back(w);
+  return res;
+}
+
 struct Range {
-  bool is_reachable;
   int lower_bound;
   int upper_bound;
+  bool is_reachable;
 };
 
 Range get_range(const PathWithScore &ps, const std::vector<AffineFunc> &edges) {
@@ -160,12 +153,11 @@ Range get_range(const PathWithScore &ps, const std::vector<AffineFunc> &edges) {
       add += std::max(0, edges[i].a0);
     }
   }
-  Range range = {
-    table.back().test(GRID_SIZE-1),
+  return {
     lb.back().back(),
-    mul * add
+    mul * add,
+    table.back().test(GRID_SIZE-1)
   };
-  return range;
 }
 
 template <typename T, typename U>
@@ -229,10 +221,12 @@ class MaxScore {
   std::atomic<int> score;
 };
 
-void worker(const std::vector<AffineFunc> &edges, TSPQ<PathWithScore> &que, TSUMM<Path, int> &memo, MaxScore &max_score) {
+void worker(const std::vector<AffineFunc> &edges, TSPQ<PathWithScore> &que, Table<TSUMM<PathBits, int>> &memo, MaxScore &max_score) {
   while (const auto ps_opt = que.try_pop()) {
     const auto ps = *ps_opt;
-    if (!ps.path.simple && ps.score < memo.get(ps.path)) continue;
+    int x = ps.path.x;
+    int y = ps.path.y;
+    if (!ps.path.simple && ps.score < memo[x][y].get(ps.path.bits)) continue;
     if (ps.upper_bound < static_cast<int>(max_score)) continue;
     if (max_score.update(ps.lower_bound)) {
       std::cerr << ps.lower_bound << ' ' << ps.score << ' ' << ps.upper_bound
@@ -240,16 +234,16 @@ void worker(const std::vector<AffineFunc> &edges, TSPQ<PathWithScore> &que, TSUM
         << std::endl;
     }
     for (int i = 0; i < 4; ++i) {
-      int nx = ps.path.x + dx[i];
-      int ny = ps.path.y + dy[i];
+      int nx = x + dx[i];
+      int ny = y + dy[i];
       if (nx < 0 || ny < 0 || nx >= GRID_SIZE || ny >= GRID_SIZE) continue;
-      int ne = ps.path.x + (2 * GRID_SIZE - 1) * ps.path.y + de[i];
+      int ne = x + (2 * GRID_SIZE - 1) * y + de[i];
       if (ps.path.bits.test(ne)) continue;
       PathBits pb = ps.path.bits;
       pb.set(ne);
       Path np(pb, nx, ny);
       int ns = edges[ne](ps.score);
-      if (np.simple || memo.update(np, ns)) {
+      if (np.simple || memo[nx][ny].update(pb, ns)) {
         PathWithScore ps(np, ns);
         Range range = get_range(ps, edges);
         if (range.is_reachable) {
@@ -257,7 +251,7 @@ void worker(const std::vector<AffineFunc> &edges, TSPQ<PathWithScore> &que, TSUM
           ps.upper_bound = range.upper_bound;
           que.push(ps);
         } else if (!np.simple) {
-          memo.force_update(np, INF);
+          memo[nx][ny].force_update(pb, INF);
         }
       }
     }
@@ -286,21 +280,21 @@ int main() {
         return -1;
     }
   }
-  TSUMM<Path, int> memo;
+  Table<TSUMM<PathBits, int>> memo = make_table<TSUMM<PathBits, int>>(GRID_SIZE, GRID_SIZE);
   TSPQ<PathWithScore> que;
-  memo.update(Path(), 1);
+  memo[0][0].update(PathBits(), 1);
   que.push(PathWithScore(Path(), 1));
   MaxScore max_score(-INF);
   std::vector<std::thread> vt;
-  ProfilerStart("paper.prof");
-  for (int i = 0; i < std::thread::hardware_concurrency(); ++i) {
+  //ProfilerStart("paper.prof");
+  for (size_t i = 0; i < std::thread::hardware_concurrency(); ++i) {
     vt.emplace_back(worker, std::cref(edges), std::ref(que), std::ref(memo), std::ref(max_score));
     sleep(1);
   }
   for (auto &&t : vt) {
     t.join();
   }
-  ProfilerStop();
+  //ProfilerStop();
   std::cout << "result: " << static_cast<int>(max_score) << std::endl;
   return 0;
 }
