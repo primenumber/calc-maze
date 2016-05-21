@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <bitset>
 #include <iostream>
@@ -11,6 +12,8 @@
 #include <boost/functional/hash.hpp>
 #include <boost/optional.hpp>
 #include "unistd.h"
+#include <gperftools/profiler.h>
+#include "bits.hpp"
 
 constexpr int INF = 100000;
 
@@ -21,14 +24,34 @@ constexpr int de[] = {0, GRID_SIZE-1, -1, -GRID_SIZE};
 constexpr int dx[] = {1, 0, -1, 0};
 constexpr int dy[] = {0, 1, 0, -1};
 
-using PathBits = std::bitset<PATH_SIZE>;
+using PathBits = PathBitsImpl<PATH_SIZE>;
+
+bool is_simple(const PathBits &bits) {
+  for (int x = 0; x < GRID_SIZE; ++x) {
+    for (int y = 0; y < GRID_SIZE; ++y) {
+      int cnt = 0;
+      for (int i = 0; i < 4; ++i) {
+        if (i - cnt > 1) break;
+        int nx = x + dx[i];
+        int ny = y + dy[i];
+        if (nx < 0 || ny < 0 || nx >= GRID_SIZE || ny >= GRID_SIZE) continue;
+        int ne = x + 13 * y + de[i];
+        if (bits.test(ne)) ++cnt;
+      }
+      if (cnt >= 3) return false;
+    }
+  }
+  return true;
+}
 
 struct Path {
   PathBits bits;
-  int8_t x, y;
-  Path() : bits(0), x(0), y(0) {}
+  int8_t x;
+  int8_t y;
+  bool simple;
+  Path() : bits(0), x(0), y(0), simple(true) {}
   Path(const PathBits &bits, const int x, const int y)
-    : bits(bits), x(x), y(y) {}
+    : bits(bits), x(x), y(y), simple(is_simple(bits)) {}
   Path(const Path &) = default;
   Path(Path &&) = default;
   Path &operator=(const Path &) = default;
@@ -49,6 +72,10 @@ class hash<Path> {
 
 } // namespace std
 
+bool operator==(const PathBits &lhs, const PathBits &rhs) {
+  return lhs.data == rhs.data;
+}
+
 bool operator==(const Path &lhs, const Path &rhs) {
   return lhs.bits == rhs.bits && lhs.x == rhs.x && lhs.y == rhs.y;
 }
@@ -67,9 +94,9 @@ struct AffineFunc {
 
 struct PathWithScore {
   Path path;
-  int score;
-  int lower_bound;
-  int upper_bound;
+  int16_t score;
+  int16_t lower_bound;
+  int16_t upper_bound;
   PathWithScore(const Path &path, const int score)
     : path(path), score(score) {}
   PathWithScore(const PathWithScore &) = default;
@@ -205,10 +232,10 @@ class MaxScore {
 void worker(const std::vector<AffineFunc> &edges, TSPQ<PathWithScore> &que, TSUMM<Path, int> &memo, MaxScore &max_score) {
   while (const auto ps_opt = que.try_pop()) {
     const auto ps = *ps_opt;
-    if (ps.score < memo.get(ps.path)) continue;
+    if (!ps.path.simple && ps.score < memo.get(ps.path)) continue;
     if (ps.upper_bound < static_cast<int>(max_score)) continue;
     if (max_score.update(ps.lower_bound)) {
-      std::cerr << static_cast<int>(max_score)
+      std::cerr << ps.lower_bound << ' ' << ps.score << ' ' << ps.upper_bound
         << ", length: " << ps.path.bits.count()
         << std::endl;
     }
@@ -222,14 +249,14 @@ void worker(const std::vector<AffineFunc> &edges, TSPQ<PathWithScore> &que, TSUM
       pb.set(ne);
       Path np(pb, nx, ny);
       int ns = edges[ne](ps.score);
-      if (memo.update(np, ns)) {
+      if (np.simple || memo.update(np, ns)) {
         PathWithScore ps(np, ns);
         Range range = get_range(ps, edges);
         if (range.is_reachable) {
           ps.lower_bound = range.lower_bound;
           ps.upper_bound = range.upper_bound;
           que.push(ps);
-        } else {
+        } else if (!np.simple) {
           memo.force_update(np, INF);
         }
       }
@@ -238,6 +265,8 @@ void worker(const std::vector<AffineFunc> &edges, TSPQ<PathWithScore> &que, TSUM
 }
 
 int main() {
+  std::cerr << sizeof(Path) << std::endl;
+  std::cerr << sizeof(PathWithScore) << std::endl;
   std::vector<AffineFunc> edges;
   for (int i = 0; i < PATH_SIZE; ++i) {
     std::string edge;
@@ -263,6 +292,7 @@ int main() {
   que.push(PathWithScore(Path(), 1));
   MaxScore max_score(-INF);
   std::vector<std::thread> vt;
+  ProfilerStart("paper.prof");
   for (int i = 0; i < std::thread::hardware_concurrency(); ++i) {
     vt.emplace_back(worker, std::cref(edges), std::ref(que), std::ref(memo), std::ref(max_score));
     sleep(1);
@@ -270,6 +300,7 @@ int main() {
   for (auto &&t : vt) {
     t.join();
   }
+  ProfilerStop();
   std::cout << "result: " << static_cast<int>(max_score) << std::endl;
   return 0;
 }
